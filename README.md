@@ -31,7 +31,6 @@ jobs:
 | `pattern` | Glob pattern to find email HTML files | `emails/**/*.html` |
 | `threshold` | Minimum score (0-100) per client | `70` |
 | `format` | Input format: `html`, `jsx`, `mjml`, or `maizzle` | `html` |
-| `api-url` | Emailens API URL | `https://emailens.dev/api/preview` |
 | `api-key` | API key for authenticated requests | - |
 | `clients` | Comma-separated client IDs to check | all clients |
 | `max-files` | Maximum files to check per run | `50` |

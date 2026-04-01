@@ -19,10 +19,6 @@ inputs:
     description: "Input format: 'html' (default), 'jsx', 'mjml', or 'maizzle'"
     required: false
     default: "html"
-  api-url:
-    description: "Emailens API URL (override for self-hosted instances)"
-    required: false
-    default: "https://emailens.dev/api/preview"
   api-key:
     description: "Emailens API key for authenticated requests (optional for free tier)"
     required: false
@@ -41,10 +37,13 @@ inputs:
 outputs:
   results:
     description: "JSON array with per-file analysis results"
+    value: ${{ steps.check.outputs.results }}
   passed:
     description: "'true' if all files pass the threshold, 'false' otherwise"
+    value: ${{ steps.check.outputs.passed }}
   summary:
     description: "Human-readable summary of results"
+    value: ${{ steps.check.outputs.summary }}
 
 runs:
   using: "composite"
@@ -56,13 +55,14 @@ runs:
         INPUT_PATTERN: ${{ inputs.pattern }}
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_FORMAT: ${{ inputs.format }}
-        INPUT_API_URL: ${{ inputs.api-url }}
         INPUT_API_KEY: ${{ inputs.api-key }}
         INPUT_CLIENTS: ${{ inputs.clients }}
         INPUT_MAX_FILES: ${{ inputs.max-files }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
         set -euo pipefail
+
+        API_URL="https://emailens.dev/api/preview"
 
         # ── Mask API key ───────────────────────────────────────────────
         if [ -n "${INPUT_API_KEY:-}" ]; then
@@ -74,6 +74,24 @@ runs:
           echo "::error::jq is required but not installed. Install jq or use a GitHub-hosted runner."
           exit 1
         fi
+        if ! command -v curl &>/dev/null; then
+          echo "::error::curl is required but not installed."
+          exit 1
+        fi
+
+        # ── Validate inputs ────────────────────────────────────────────
+        if ! [[ "$INPUT_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$INPUT_THRESHOLD" -lt 0 ] || [ "$INPUT_THRESHOLD" -gt 100 ]; then
+          echo "::error::threshold must be an integer between 0 and 100 (got '$INPUT_THRESHOLD')"
+          exit 1
+        fi
+        if ! [[ "$INPUT_MAX_FILES" =~ ^[0-9]+$ ]] || [ "$INPUT_MAX_FILES" -lt 1 ]; then
+          echo "::error::max-files must be a positive integer (got '$INPUT_MAX_FILES')"
+          exit 1
+        fi
+        case "$INPUT_FORMAT" in
+          html|jsx|mjml|maizzle) ;;
+          *) echo "::error::format must be html, jsx, mjml, or maizzle (got '$INPUT_FORMAT')"; exit 1 ;;
+        esac
 
         # ── Find files using bash globstar ─────────────────────────────
         shopt -s globstar nullglob
@@ -89,14 +107,27 @@ runs:
         fi
 
         TOTAL_FOUND=${#FILES_ARRAY[@]}
-        MAX_FILES=${INPUT_MAX_FILES:-50}
 
-        if [ "$TOTAL_FOUND" -gt "$MAX_FILES" ]; then
-          echo "::warning::Found $TOTAL_FOUND files but max-files is $MAX_FILES. Checking first $MAX_FILES only."
-          FILES_ARRAY=( "${FILES_ARRAY[@]:0:$MAX_FILES}" )
+        if [ "$TOTAL_FOUND" -gt "$INPUT_MAX_FILES" ]; then
+          echo "::warning::Found $TOTAL_FOUND files but max-files is $INPUT_MAX_FILES. Checking first $INPUT_MAX_FILES only."
+          FILES_ARRAY=( "${FILES_ARRAY[@]:0:$INPUT_MAX_FILES}" )
         fi
 
         echo "Found ${#FILES_ARRAY[@]} email template(s)"
+
+        # ── Temp directory ─────────────────────────────────────────────
+        TMPDIR="${RUNNER_TEMP:-/tmp}/emailens-$$"
+        mkdir -p "$TMPDIR"
+        cleanup() { rm -rf "$TMPDIR"; }
+        trap cleanup EXIT
+
+        # ── jq --rawfile compatibility (requires jq 1.6+) ─────────────
+        JQ_VERSION=$(jq --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        HAS_RAWFILE=true
+        if [ "$(printf '%s\n' "1.6" "$JQ_VERSION" | sort -V | head -1)" != "1.6" ]; then
+          HAS_RAWFILE=false
+          echo "::notice::jq $JQ_VERSION detected (< 1.6). Using fallback for file reading."
+        fi
 
         # ── Process files ──────────────────────────────────────────────
         PASSED=true
@@ -111,15 +142,18 @@ runs:
           TOTAL_FILES=$((TOTAL_FILES + 1))
           echo "::group::Checking $FILE"
 
-          # Read HTML into a temp file for curl (avoids shell arg limits)
-          TMPBODY=$(mktemp)
-          TMPRESPONSE=$(mktemp)
-          trap "rm -f '$TMPBODY' '$TMPRESPONSE'" EXIT
+          TMPBODY="$TMPDIR/body-$TOTAL_FILES.json"
+          TMPRESPONSE="$TMPDIR/response-$TOTAL_FILES.json"
 
           # Build request body via jq (safe for any content)
-          REQUEST=$(jq -n --rawfile html "$FILE" '{html: $html}')
+          if [ "$HAS_RAWFILE" = true ]; then
+            REQUEST=$(jq -n --rawfile html "$FILE" '{html: $html}')
+          else
+            # Fallback: read file content via slurp
+            REQUEST=$(jq -Rs '{html: .}' "$FILE")
+          fi
 
-          if [ -n "${INPUT_FORMAT:-}" ] && [ "$INPUT_FORMAT" != "html" ]; then
+          if [ "$INPUT_FORMAT" != "html" ]; then
             REQUEST=$(echo "$REQUEST" | jq --arg fmt "$INPUT_FORMAT" '. + {format: $fmt}')
           fi
 
@@ -130,7 +164,7 @@ runs:
 
           echo "$REQUEST" > "$TMPBODY"
 
-          # Call API with retry
+          # Call API with retry (honors Retry-After header)
           HEADERS=(-H "Content-Type: application/json")
           if [ -n "${INPUT_API_KEY:-}" ]; then
             HEADERS+=(-H "Authorization: Bearer $INPUT_API_KEY")
@@ -139,13 +173,19 @@ runs:
           HTTP_CODE=""
           for ATTEMPT in $(seq 0 $MAX_RETRIES); do
             if [ "$ATTEMPT" -gt 0 ]; then
-              DELAY=$((ATTEMPT * 2))
+              # Check Retry-After header from previous response, fall back to exponential
+              RETRY_AFTER=$(grep -i "^retry-after:" "$TMPDIR/headers-$TOTAL_FILES" 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+              DELAY=${RETRY_AFTER:-$((ATTEMPT * 2))}
+              # Cap delay at 30s
+              [ "$DELAY" -gt 30 ] 2>/dev/null && DELAY=30
               echo "  Retrying in ${DELAY}s (attempt $((ATTEMPT + 1))/$((MAX_RETRIES + 1)))..."
               sleep "$DELAY"
             fi
 
-            HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMPRESPONSE" \
-              -X POST "$INPUT_API_URL" \
+            HTTP_CODE=$(curl -s -w "%{http_code}" \
+              -o "$TMPRESPONSE" \
+              -D "$TMPDIR/headers-$TOTAL_FILES" \
+              -X POST "$API_URL" \
               "${HEADERS[@]}" \
               --data-binary @"$TMPBODY" \
               --max-time 60)
@@ -159,11 +199,10 @@ runs:
           done
 
           RESPONSE_BODY=$(cat "$TMPRESPONSE")
-          rm -f "$TMPBODY" "$TMPRESPONSE"
 
           if [ "$HTTP_CODE" != "200" ]; then
-            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
-            echo "::error file=$FILE::API request failed: $ERROR_MSG (HTTP $HTTP_CODE)"
+            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error // empty' 2>/dev/null || true)
+            echo "::error file=$FILE::API request failed (HTTP $HTTP_CODE)${ERROR_MSG:+: $ERROR_MSG}"
             PASSED=false
             FAILED_FILES=$((FAILED_FILES + 1))
             echo "::endgroup::"
@@ -188,18 +227,18 @@ runs:
             ERRORS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].errors // 0')
             WARNINGS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].warnings // 0')
 
-            ICON="pass"
+            ICON="ok"
             if [ "$SCORE" -lt "$INPUT_THRESHOLD" ]; then
-              ICON="fail"
+              ICON="FAIL"
               FILE_PASSED=false
               echo "::error file=$FILE::$CLIENT_ID score $SCORE is below threshold $INPUT_THRESHOLD (${ERRORS}E ${WARNINGS}W)"
             elif [ "$ERRORS" -gt 0 ] && [ "$INPUT_FAIL_ON_ERROR" = "true" ]; then
-              ICON="warn"
+              ICON="WARN"
               FILE_PASSED=false
               echo "::warning file=$FILE::$CLIENT_ID has $ERRORS error(s) (score: $SCORE)"
             fi
 
-            FILE_SUMMARY="${FILE_SUMMARY}\n  $([ "$ICON" = "fail" ] && echo "X" || ([ "$ICON" = "warn" ] && echo "!" || echo "ok")) $CLIENT_ID: $SCORE/100 (${ERRORS}E ${WARNINGS}W)"
+            FILE_SUMMARY="${FILE_SUMMARY}\n  [$ICON] $CLIENT_ID: $SCORE/100 (${ERRORS}E ${WARNINGS}W)"
           done < <(echo "$RESPONSE_BODY" | jq -r '.compatibilityScores | keys[]')
 
           if [ "$FILE_PASSED" = false ]; then
@@ -207,9 +246,14 @@ runs:
             FAILED_FILES=$((FAILED_FILES + 1))
           fi
 
-          # Append to results array
-          ALL_RESULTS=$(echo "$ALL_RESULTS" | jq --arg file "$FILE" --argjson scores "$(echo "$RESPONSE_BODY" | jq '.compatibilityScores')" \
-            '. + [{"file": $file, "scores": $scores}]')
+          # Append to results array (cap at 500KB to stay under GitHub's 1MB output limit)
+          RESULT_ENTRY=$(echo "$RESPONSE_BODY" | jq --arg file "$FILE" '{file: $file, scores: .compatibilityScores}')
+          CANDIDATE=$(echo "$ALL_RESULTS" | jq --argjson entry "$RESULT_ENTRY" '. + [$entry]')
+          if [ ${#CANDIDATE} -lt 512000 ]; then
+            ALL_RESULTS="$CANDIDATE"
+          else
+            echo "::warning::Results output truncated at $TOTAL_FILES files to stay within GitHub output limits."
+          fi
 
           SUMMARY="${SUMMARY}\n$FILE:$FILE_SUMMARY"
           echo -e "$FILE_SUMMARY"

@@ -1,5 +1,5 @@
 name: "Emailens Email Preview Check"
-description: "Check HTML email templates for rendering issues across 15 email clients. Fails the build if compatibility scores drop below threshold. Also available as an MCP server for AI-assisted fixing."
+description: "Check HTML email templates for rendering issues across 15 email clients. Fails the build if compatibility scores drop below threshold."
 author: "Emailens"
 
 branding:
@@ -9,12 +9,16 @@ branding:
 inputs:
   pattern:
     description: "Glob pattern to find email HTML files (e.g. 'emails/**/*.html')"
-    required: true
+    required: false
     default: "emails/**/*.html"
   threshold:
     description: "Minimum compatibility score (0-100) per client. Fails if any client scores below this."
     required: false
     default: "70"
+  format:
+    description: "Input format: 'html' (default), 'jsx', 'mjml', or 'maizzle'"
+    required: false
+    default: "html"
   api-url:
     description: "Emailens API URL (override for self-hosted instances)"
     required: false
@@ -25,6 +29,10 @@ inputs:
   clients:
     description: "Comma-separated list of client IDs to check (default: all clients)"
     required: false
+  max-files:
+    description: "Maximum number of files to check (default: 50)"
+    required: false
+    default: "50"
   fail-on-error:
     description: "Whether to fail the action if critical errors are found"
     required: false
@@ -32,7 +40,7 @@ inputs:
 
 outputs:
   results:
-    description: "JSON string with full analysis results"
+    description: "JSON array with per-file analysis results"
   passed:
     description: "'true' if all files pass the threshold, 'false' otherwise"
   summary:
@@ -41,70 +49,130 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Find email templates
-      id: find-files
-      shell: bash
-      run: |
-        FILES=$(find . -path "./${{ inputs.pattern }}" -type f 2>/dev/null | head -50)
-        if [ -z "$FILES" ]; then
-          echo "::warning::No email HTML files found matching pattern '${{ inputs.pattern }}'"
-          echo "files=" >> $GITHUB_OUTPUT
-          exit 0
-        fi
-        echo "Found email templates:"
-        echo "$FILES"
-        # Store as JSON array for the check script
-        JSON_FILES=$(echo "$FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-        echo "files=$JSON_FILES" >> $GITHUB_OUTPUT
-
     - name: Check email compatibility
-      if: steps.find-files.outputs.files != ''
       id: check
       shell: bash
       env:
-        EMAIL_FILES: ${{ steps.find-files.outputs.files }}
-        THRESHOLD: ${{ inputs.threshold }}
-        API_URL: ${{ inputs.api-url }}
-        API_KEY: ${{ inputs.api-key }}
-        CLIENTS: ${{ inputs.clients }}
-        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        INPUT_PATTERN: ${{ inputs.pattern }}
+        INPUT_THRESHOLD: ${{ inputs.threshold }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_API_URL: ${{ inputs.api-url }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_CLIENTS: ${{ inputs.clients }}
+        INPUT_MAX_FILES: ${{ inputs.max-files }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
+        set -euo pipefail
+
+        # ── Mask API key ───────────────────────────────────────────────
+        if [ -n "${INPUT_API_KEY:-}" ]; then
+          echo "::add-mask::$INPUT_API_KEY"
+        fi
+
+        # ── Check dependencies ─────────────────────────────────────────
+        if ! command -v jq &>/dev/null; then
+          echo "::error::jq is required but not installed. Install jq or use a GitHub-hosted runner."
+          exit 1
+        fi
+
+        # ── Find files using bash globstar ─────────────────────────────
+        shopt -s globstar nullglob
+        FILES_ARRAY=( $INPUT_PATTERN )
+        shopt -u globstar nullglob
+
+        if [ ${#FILES_ARRAY[@]} -eq 0 ]; then
+          echo "::warning::No email HTML files found matching pattern '$INPUT_PATTERN'"
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "summary=No files found" >> "$GITHUB_OUTPUT"
+          echo "results=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        TOTAL_FOUND=${#FILES_ARRAY[@]}
+        MAX_FILES=${INPUT_MAX_FILES:-50}
+
+        if [ "$TOTAL_FOUND" -gt "$MAX_FILES" ]; then
+          echo "::warning::Found $TOTAL_FOUND files but max-files is $MAX_FILES. Checking first $MAX_FILES only."
+          FILES_ARRAY=( "${FILES_ARRAY[@]:0:$MAX_FILES}" )
+        fi
+
+        echo "Found ${#FILES_ARRAY[@]} email template(s)"
+
+        # ── Process files ──────────────────────────────────────────────
         PASSED=true
         SUMMARY=""
         ALL_RESULTS="[]"
         TOTAL_FILES=0
         FAILED_FILES=0
+        MAX_RETRIES=2
 
-        for FILE in $(echo "$EMAIL_FILES" | jq -r '.[]'); do
+        for FILE in "${FILES_ARRAY[@]}"; do
+          [ -f "$FILE" ] || continue
           TOTAL_FILES=$((TOTAL_FILES + 1))
           echo "::group::Checking $FILE"
 
-          HTML_CONTENT=$(cat "$FILE")
+          # Read HTML into a temp file for curl (avoids shell arg limits)
+          TMPBODY=$(mktemp)
+          TMPRESPONSE=$(mktemp)
+          trap "rm -f '$TMPBODY' '$TMPRESPONSE'" EXIT
 
-          # Build request body
-          BODY=$(jq -n --arg html "$HTML_CONTENT" '{html: $html}')
-          if [ -n "$CLIENTS" ]; then
-            CLIENT_ARRAY=$(echo "$CLIENTS" | jq -R -c 'split(",")')
-            BODY=$(echo "$BODY" | jq --argjson clients "$CLIENT_ARRAY" '. + {clients: $clients}')
+          # Build request body via jq (safe for any content)
+          REQUEST=$(jq -n --rawfile html "$FILE" '{html: $html}')
+
+          if [ -n "${INPUT_FORMAT:-}" ] && [ "$INPUT_FORMAT" != "html" ]; then
+            REQUEST=$(echo "$REQUEST" | jq --arg fmt "$INPUT_FORMAT" '. + {format: $fmt}')
           fi
 
-          # Call the API
+          if [ -n "${INPUT_CLIENTS:-}" ]; then
+            CLIENT_ARRAY=$(echo "$INPUT_CLIENTS" | jq -R -c 'split(",")')
+            REQUEST=$(echo "$REQUEST" | jq --argjson clients "$CLIENT_ARRAY" '. + {clients: $clients}')
+          fi
+
+          echo "$REQUEST" > "$TMPBODY"
+
+          # Call API with retry
           HEADERS=(-H "Content-Type: application/json")
-          if [ -n "$API_KEY" ]; then
-            HEADERS+=(-H "Authorization: Bearer $API_KEY")
+          if [ -n "${INPUT_API_KEY:-}" ]; then
+            HEADERS+=(-H "Authorization: Bearer $INPUT_API_KEY")
           fi
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "$API_URL" \
-            "${HEADERS[@]}" \
-            -d "$BODY" \
-            --max-time 30)
+          HTTP_CODE=""
+          for ATTEMPT in $(seq 0 $MAX_RETRIES); do
+            if [ "$ATTEMPT" -gt 0 ]; then
+              DELAY=$((ATTEMPT * 2))
+              echo "  Retrying in ${DELAY}s (attempt $((ATTEMPT + 1))/$((MAX_RETRIES + 1)))..."
+              sleep "$DELAY"
+            fi
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+            HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMPRESPONSE" \
+              -X POST "$INPUT_API_URL" \
+              "${HEADERS[@]}" \
+              --data-binary @"$TMPBODY" \
+              --max-time 60)
+
+            # Retry on 429 or 5xx
+            if [ "$HTTP_CODE" = "429" ] || [ "${HTTP_CODE:0:1}" = "5" ]; then
+              echo "  HTTP $HTTP_CODE — transient error"
+              continue
+            fi
+            break
+          done
+
+          RESPONSE_BODY=$(cat "$TMPRESPONSE")
+          rm -f "$TMPBODY" "$TMPRESPONSE"
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error file=$FILE::API request failed with HTTP $HTTP_CODE"
+            ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+            echo "::error file=$FILE::API request failed: $ERROR_MSG (HTTP $HTTP_CODE)"
+            PASSED=false
+            FAILED_FILES=$((FAILED_FILES + 1))
+            echo "::endgroup::"
+            continue
+          fi
+
+          # Validate response has expected shape
+          if ! echo "$RESPONSE_BODY" | jq -e '.compatibilityScores' &>/dev/null; then
+            echo "::error file=$FILE::Unexpected API response (missing compatibilityScores)"
             PASSED=false
             FAILED_FILES=$((FAILED_FILES + 1))
             echo "::endgroup::"
@@ -115,59 +183,69 @@ runs:
           FILE_PASSED=true
           FILE_SUMMARY=""
 
-          SCORES=$(echo "$RESPONSE_BODY" | jq -r '.compatibilityScores')
-          for CLIENT_ID in $(echo "$SCORES" | jq -r 'keys[]'); do
-            SCORE=$(echo "$SCORES" | jq -r --arg c "$CLIENT_ID" '.[$c].score')
-            ERRORS=$(echo "$SCORES" | jq -r --arg c "$CLIENT_ID" '.[$c].errors')
-            WARNINGS=$(echo "$SCORES" | jq -r --arg c "$CLIENT_ID" '.[$c].warnings')
+          while IFS= read -r CLIENT_ID; do
+            SCORE=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].score // 0')
+            ERRORS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].errors // 0')
+            WARNINGS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].warnings // 0')
 
-            ICON="✅"
-            if [ "$SCORE" -lt "$THRESHOLD" ]; then
-              ICON="❌"
+            ICON="pass"
+            if [ "$SCORE" -lt "$INPUT_THRESHOLD" ]; then
+              ICON="fail"
               FILE_PASSED=false
-              echo "::error file=$FILE::$CLIENT_ID score $SCORE is below threshold $THRESHOLD (${ERRORS}E ${WARNINGS}W)"
-            elif [ "$ERRORS" -gt 0 ] && [ "$FAIL_ON_ERROR" = "true" ]; then
-              ICON="⚠️"
+              echo "::error file=$FILE::$CLIENT_ID score $SCORE is below threshold $INPUT_THRESHOLD (${ERRORS}E ${WARNINGS}W)"
+            elif [ "$ERRORS" -gt 0 ] && [ "$INPUT_FAIL_ON_ERROR" = "true" ]; then
+              ICON="warn"
               FILE_PASSED=false
               echo "::warning file=$FILE::$CLIENT_ID has $ERRORS error(s) (score: $SCORE)"
             fi
 
-            FILE_SUMMARY="$FILE_SUMMARY\n  $ICON $CLIENT_ID: $SCORE/100 (${ERRORS}E ${WARNINGS}W)"
-          done
+            FILE_SUMMARY="${FILE_SUMMARY}\n  $([ "$ICON" = "fail" ] && echo "X" || ([ "$ICON" = "warn" ] && echo "!" || echo "ok")) $CLIENT_ID: $SCORE/100 (${ERRORS}E ${WARNINGS}W)"
+          done < <(echo "$RESPONSE_BODY" | jq -r '.compatibilityScores | keys[]')
 
           if [ "$FILE_PASSED" = false ]; then
             PASSED=false
             FAILED_FILES=$((FAILED_FILES + 1))
           fi
 
-          SUMMARY="$SUMMARY\n📄 $FILE:$FILE_SUMMARY"
+          # Append to results array
+          ALL_RESULTS=$(echo "$ALL_RESULTS" | jq --arg file "$FILE" --argjson scores "$(echo "$RESPONSE_BODY" | jq '.compatibilityScores')" \
+            '. + [{"file": $file, "scores": $scores}]')
+
+          SUMMARY="${SUMMARY}\n$FILE:$FILE_SUMMARY"
           echo -e "$FILE_SUMMARY"
           echo "::endgroup::"
         done
 
-        # Set outputs
-        echo "passed=$PASSED" >> $GITHUB_OUTPUT
-        echo "summary<<EOF" >> $GITHUB_OUTPUT
-        echo -e "$SUMMARY" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+        # ── Set outputs ────────────────────────────────────────────────
+        echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
 
-        # Write job summary
-        echo "## Emailens Email Preview Check" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        if [ "$PASSED" = true ]; then
-          echo "✅ **All $TOTAL_FILES template(s) passed** (threshold: $THRESHOLD/100)" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "❌ **$FAILED_FILES of $TOTAL_FILES template(s) failed** (threshold: $THRESHOLD/100)" >> $GITHUB_STEP_SUMMARY
-        fi
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo -e "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+        echo "summary<<EMAILENS_EOF" >> "$GITHUB_OUTPUT"
+        echo -e "$SUMMARY" >> "$GITHUB_OUTPUT"
+        echo "EMAILENS_EOF" >> "$GITHUB_OUTPUT"
 
-        # Exit with failure if any file failed
+        echo "results<<EMAILENS_RESULTS_EOF" >> "$GITHUB_OUTPUT"
+        echo "$ALL_RESULTS" >> "$GITHUB_OUTPUT"
+        echo "EMAILENS_RESULTS_EOF" >> "$GITHUB_OUTPUT"
+
+        # ── Job summary ────────────────────────────────────────────────
+        {
+          echo "## Emailens Email Preview Check"
+          echo ""
+          if [ "$PASSED" = true ]; then
+            echo "**All $TOTAL_FILES template(s) passed** (threshold: $INPUT_THRESHOLD/100)"
+          else
+            echo "**$FAILED_FILES of $TOTAL_FILES template(s) failed** (threshold: $INPUT_THRESHOLD/100)"
+          fi
+          echo ""
+          echo -e "$SUMMARY"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # ── Exit ───────────────────────────────────────────────────────
         if [ "$PASSED" = false ]; then
           echo ""
-          echo "❌ Email compatibility check failed. $FAILED_FILES file(s) below threshold."
+          echo "Email compatibility check failed. $FAILED_FILES file(s) below threshold."
           exit 1
         fi
 
         echo ""
-        echo "✅ All email templates pass compatibility threshold ($THRESHOLD/100)"
+        echo "All email templates pass compatibility threshold ($INPUT_THRESHOLD/100)"

@@ -30,9 +30,11 @@ jobs:
 |-------|-------------|---------|
 | `pattern` | Glob pattern to find email HTML files | `emails/**/*.html` |
 | `threshold` | Minimum score (0-100) per client | `70` |
+| `format` | Input format: `html`, `jsx`, `mjml`, or `maizzle` | `html` |
 | `api-url` | Emailens API URL | `https://emailens.dev/api/preview` |
 | `api-key` | API key for authenticated requests | - |
 | `clients` | Comma-separated client IDs to check | all clients |
+| `max-files` | Maximum files to check per run | `50` |
 | `fail-on-error` | Fail if critical errors found | `true` |
 
 ## Outputs
@@ -41,7 +43,7 @@ jobs:
 |--------|-------------|
 | `passed` | `true` if all files pass, `false` otherwise |
 | `summary` | Human-readable results summary |
-| `results` | Full JSON analysis results |
+| `results` | JSON array with per-file scores |
 
 ## Example with all options
 
@@ -50,10 +52,14 @@ jobs:
   with:
     pattern: "src/emails/**/*.html"
     threshold: "80"
+    format: "mjml"
     api-key: ${{ secrets.EMAILENS_API_KEY }}
     clients: "gmail-web,outlook-windows,apple-mail-macos"
+    max-files: "20"
     fail-on-error: "true"
 ```
+
+> **Quota note:** Free tier allows 30 previews/day. Each file counts as one preview. Use `max-files` and `clients` to stay within limits, or add an `api-key` for higher quotas.
 
 ## Available Client IDs
 

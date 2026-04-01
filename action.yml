@@ -60,7 +60,8 @@ runs:
         INPUT_MAX_FILES: ${{ inputs.max-files }}
         INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
       run: |
-        set -euo pipefail
+        # Disable set -e — we handle errors explicitly to avoid silent crashes
+        set -uo pipefail
 
         API_URL="https://emailens.dev/api/preview"
 
@@ -70,14 +71,12 @@ runs:
         fi
 
         # ── Check dependencies ─────────────────────────────────────────
-        if ! command -v jq &>/dev/null; then
-          echo "::error::jq is required but not installed. Install jq or use a GitHub-hosted runner."
-          exit 1
-        fi
-        if ! command -v curl &>/dev/null; then
-          echo "::error::curl is required but not installed."
-          exit 1
-        fi
+        for cmd in jq curl; do
+          if ! command -v "$cmd" &>/dev/null; then
+            echo "::error::$cmd is required but not installed. Use a GitHub-hosted runner or install it."
+            exit 1
+          fi
+        done
 
         # ── Validate inputs ────────────────────────────────────────────
         if ! [[ "$INPUT_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$INPUT_THRESHOLD" -lt 0 ] || [ "$INPUT_THRESHOLD" -gt 100 ]; then
@@ -98,6 +97,13 @@ runs:
         FILES_ARRAY=( $INPUT_PATTERN )
         shopt -u globstar nullglob
 
+        # Filter to regular files only (exclude directories)
+        FILTERED=()
+        for f in "${FILES_ARRAY[@]}"; do
+          [ -f "$f" ] && FILTERED+=("$f")
+        done
+        FILES_ARRAY=("${FILTERED[@]+"${FILTERED[@]}"}")
+
         if [ ${#FILES_ARRAY[@]} -eq 0 ]; then
           echo "::warning::No email HTML files found matching pattern '$INPUT_PATTERN'"
           echo "passed=true" >> "$GITHUB_OUTPUT"
@@ -116,17 +122,19 @@ runs:
         echo "Found ${#FILES_ARRAY[@]} email template(s)"
 
         # ── Temp directory ─────────────────────────────────────────────
-        TMPDIR="${RUNNER_TEMP:-/tmp}/emailens-$$"
-        mkdir -p "$TMPDIR"
-        cleanup() { rm -rf "$TMPDIR"; }
+        WORK_DIR="${RUNNER_TEMP:-/tmp}/emailens-$$"
+        mkdir -p "$WORK_DIR"
+        cleanup() { rm -rf "$WORK_DIR"; }
         trap cleanup EXIT
 
-        # ── jq --rawfile compatibility (requires jq 1.6+) ─────────────
-        JQ_VERSION=$(jq --version 2>&1 | grep -oP '[\d.]+' | head -1)
+        # ── Randomized HEREDOC delimiter (prevents injection) ──────────
+        DELIM="EMAILENS_$(head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+
+        # ── jq version check (--rawfile requires 1.6+) ────────────────
         HAS_RAWFILE=true
-        if [ "$(printf '%s\n' "1.6" "$JQ_VERSION" | sort -V | head -1)" != "1.6" ]; then
+        if ! jq -n --rawfile x /dev/null '""' &>/dev/null; then
           HAS_RAWFILE=false
-          echo "::notice::jq $JQ_VERSION detected (< 1.6). Using fallback for file reading."
+          echo "::notice::jq $(jq --version 2>&1) does not support --rawfile. Using fallback."
         fi
 
         # ── Process files ──────────────────────────────────────────────
@@ -135,70 +143,88 @@ runs:
         ALL_RESULTS="[]"
         TOTAL_FILES=0
         FAILED_FILES=0
+        RESULTS_TRUNCATED=false
         MAX_RETRIES=2
 
         for FILE in "${FILES_ARRAY[@]}"; do
-          [ -f "$FILE" ] || continue
           TOTAL_FILES=$((TOTAL_FILES + 1))
           echo "::group::Checking $FILE"
 
-          TMPBODY="$TMPDIR/body-$TOTAL_FILES.json"
-          TMPRESPONSE="$TMPDIR/response-$TOTAL_FILES.json"
+          TMPBODY="$WORK_DIR/body-$TOTAL_FILES.json"
+          TMPRESPONSE="$WORK_DIR/response-$TOTAL_FILES.json"
+          TMPHEADERS="$WORK_DIR/headers-$TOTAL_FILES.txt"
 
           # Build request body via jq (safe for any content)
           if [ "$HAS_RAWFILE" = true ]; then
-            REQUEST=$(jq -n --rawfile html "$FILE" '{html: $html}')
+            jq -n --rawfile html "$FILE" '{html: $html}' > "$TMPBODY" 2>/dev/null
           else
-            # Fallback: read file content via slurp
-            REQUEST=$(jq -Rs '{html: .}' "$FILE")
+            jq -Rs '{html: .}' < "$FILE" > "$TMPBODY" 2>/dev/null
+          fi
+
+          if [ ! -s "$TMPBODY" ]; then
+            echo "::error file=$FILE::Failed to read file or build request body"
+            PASSED=false
+            FAILED_FILES=$((FAILED_FILES + 1))
+            echo "::endgroup::"
+            continue
           fi
 
           if [ "$INPUT_FORMAT" != "html" ]; then
-            REQUEST=$(echo "$REQUEST" | jq --arg fmt "$INPUT_FORMAT" '. + {format: $fmt}')
+            jq --arg fmt "$INPUT_FORMAT" '. + {format: $fmt}' < "$TMPBODY" > "$TMPBODY.tmp" && mv "$TMPBODY.tmp" "$TMPBODY"
           fi
 
           if [ -n "${INPUT_CLIENTS:-}" ]; then
-            CLIENT_ARRAY=$(echo "$INPUT_CLIENTS" | jq -R -c 'split(",")')
-            REQUEST=$(echo "$REQUEST" | jq --argjson clients "$CLIENT_ARRAY" '. + {clients: $clients}')
+            # Trim spaces around commas
+            CLEAN_CLIENTS=$(echo "$INPUT_CLIENTS" | sed 's/ *, */,/g')
+            jq --argjson clients "$(echo "$CLEAN_CLIENTS" | jq -R -c 'split(",")')" '. + {clients: $clients}' < "$TMPBODY" > "$TMPBODY.tmp" && mv "$TMPBODY.tmp" "$TMPBODY"
           fi
 
-          echo "$REQUEST" > "$TMPBODY"
-
-          # Call API with retry (honors Retry-After header)
-          HEADERS=(-H "Content-Type: application/json")
+          # Call API with retry
+          CURL_HEADERS=(-H "Content-Type: application/json")
           if [ -n "${INPUT_API_KEY:-}" ]; then
-            HEADERS+=(-H "Authorization: Bearer $INPUT_API_KEY")
+            CURL_HEADERS+=(-H "Authorization: Bearer $INPUT_API_KEY")
           fi
 
           HTTP_CODE=""
           for ATTEMPT in $(seq 0 $MAX_RETRIES); do
             if [ "$ATTEMPT" -gt 0 ]; then
-              # Check Retry-After header from previous response, fall back to exponential
-              RETRY_AFTER=$(grep -i "^retry-after:" "$TMPDIR/headers-$TOTAL_FILES" 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
-              DELAY=${RETRY_AFTER:-$((ATTEMPT * 2))}
-              # Cap delay at 30s
-              [ "$DELAY" -gt 30 ] 2>/dev/null && DELAY=30
+              # Parse Retry-After (only accept integer seconds, ignore date format)
+              RETRY_AFTER=""
+              if [ -f "$TMPHEADERS" ]; then
+                RETRY_AFTER=$(grep -i "^retry-after:" "$TMPHEADERS" 2>/dev/null | awk '{print $2}' | tr -d '\r' || true)
+              fi
+              # Validate it's a reasonable integer, otherwise use exponential backoff
+              if [[ "$RETRY_AFTER" =~ ^[0-9]+$ ]] && [ "$RETRY_AFTER" -le 30 ]; then
+                DELAY="$RETRY_AFTER"
+              else
+                DELAY=$((ATTEMPT * 2))
+              fi
               echo "  Retrying in ${DELAY}s (attempt $((ATTEMPT + 1))/$((MAX_RETRIES + 1)))..."
               sleep "$DELAY"
             fi
 
             HTTP_CODE=$(curl -s -w "%{http_code}" \
               -o "$TMPRESPONSE" \
-              -D "$TMPDIR/headers-$TOTAL_FILES" \
+              -D "$TMPHEADERS" \
               -X POST "$API_URL" \
-              "${HEADERS[@]}" \
+              "${CURL_HEADERS[@]}" \
               --data-binary @"$TMPBODY" \
-              --max-time 60)
+              --max-time 60 \
+              2>/dev/null) || HTTP_CODE="000"
 
-            # Retry on 429 or 5xx
-            if [ "$HTTP_CODE" = "429" ] || [ "${HTTP_CODE:0:1}" = "5" ]; then
+            # Retry on network failure, 429, or 5xx
+            if [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" = "429" ] || [[ "$HTTP_CODE" =~ ^5[0-9][0-9]$ ]]; then
               echo "  HTTP $HTTP_CODE — transient error"
               continue
             fi
             break
           done
 
-          RESPONSE_BODY=$(cat "$TMPRESPONSE")
+          # Read response body safely
+          RESPONSE_BODY=""
+          if [ -f "$TMPRESPONSE" ]; then
+            RESPONSE_BODY=$(cat "$TMPRESPONSE")
+          fi
 
           if [ "$HTTP_CODE" != "200" ]; then
             ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.error // empty' 2>/dev/null || true)
@@ -218,28 +244,32 @@ runs:
             continue
           fi
 
-          # Parse scores
+          # Parse scores — extract all at once to avoid repeated jq calls on bad JSON
+          SCORES_JSON=$(echo "$RESPONSE_BODY" | jq -c '.compatibilityScores' 2>/dev/null) || {
+            echo "::error file=$FILE::Failed to parse compatibility scores"
+            PASSED=false
+            FAILED_FILES=$((FAILED_FILES + 1))
+            echo "::endgroup::"
+            continue
+          }
+
           FILE_PASSED=true
           FILE_SUMMARY=""
 
-          while IFS= read -r CLIENT_ID; do
-            SCORE=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].score // 0')
-            ERRORS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].errors // 0')
-            WARNINGS=$(echo "$RESPONSE_BODY" | jq -r --arg c "$CLIENT_ID" '.compatibilityScores[$c].warnings // 0')
-
+          while IFS=$'\t' read -r CLIENT_ID SCORE ERRORS WARNINGS; do
             ICON="ok"
-            if [ "$SCORE" -lt "$INPUT_THRESHOLD" ]; then
+            if [ "$SCORE" -lt "$INPUT_THRESHOLD" ] 2>/dev/null; then
               ICON="FAIL"
               FILE_PASSED=false
               echo "::error file=$FILE::$CLIENT_ID score $SCORE is below threshold $INPUT_THRESHOLD (${ERRORS}E ${WARNINGS}W)"
-            elif [ "$ERRORS" -gt 0 ] && [ "$INPUT_FAIL_ON_ERROR" = "true" ]; then
+            elif [ "$ERRORS" -gt 0 ] 2>/dev/null && [ "$INPUT_FAIL_ON_ERROR" = "true" ]; then
               ICON="WARN"
               FILE_PASSED=false
               echo "::warning file=$FILE::$CLIENT_ID has $ERRORS error(s) (score: $SCORE)"
             fi
 
             FILE_SUMMARY="${FILE_SUMMARY}\n  [$ICON] $CLIENT_ID: $SCORE/100 (${ERRORS}E ${WARNINGS}W)"
-          done < <(echo "$RESPONSE_BODY" | jq -r '.compatibilityScores | keys[]')
+          done < <(echo "$SCORES_JSON" | jq -r 'to_entries[] | [.key, (.value.score // 0), (.value.errors // 0), (.value.warnings // 0)] | @tsv')
 
           if [ "$FILE_PASSED" = false ]; then
             PASSED=false
@@ -247,12 +277,17 @@ runs:
           fi
 
           # Append to results array (cap at 500KB to stay under GitHub's 1MB output limit)
-          RESULT_ENTRY=$(echo "$RESPONSE_BODY" | jq --arg file "$FILE" '{file: $file, scores: .compatibilityScores}')
-          CANDIDATE=$(echo "$ALL_RESULTS" | jq --argjson entry "$RESULT_ENTRY" '. + [$entry]')
-          if [ ${#CANDIDATE} -lt 512000 ]; then
-            ALL_RESULTS="$CANDIDATE"
-          else
-            echo "::warning::Results output truncated at $TOTAL_FILES files to stay within GitHub output limits."
+          if [ "$RESULTS_TRUNCATED" = false ]; then
+            RESULT_ENTRY=$(echo "$SCORES_JSON" | jq --arg file "$FILE" '{file: $file, scores: .}' 2>/dev/null) || RESULT_ENTRY=""
+            if [ -n "$RESULT_ENTRY" ]; then
+              CANDIDATE=$(echo "$ALL_RESULTS" | jq --argjson entry "$RESULT_ENTRY" '. + [$entry]' 2>/dev/null) || CANDIDATE=""
+              if [ -n "$CANDIDATE" ] && [ ${#CANDIDATE} -lt 512000 ]; then
+                ALL_RESULTS="$CANDIDATE"
+              else
+                RESULTS_TRUNCATED=true
+                echo "::warning::Results output truncated to stay within GitHub output limits."
+              fi
+            fi
           fi
 
           SUMMARY="${SUMMARY}\n$FILE:$FILE_SUMMARY"
@@ -260,16 +295,25 @@ runs:
           echo "::endgroup::"
         done
 
+        # ── Guard: no files processed ──────────────────────────────────
+        if [ "$TOTAL_FILES" -eq 0 ]; then
+          echo "::warning::Glob matched entries but none were regular files."
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "summary=No files found" >> "$GITHUB_OUTPUT"
+          echo "results=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
         # ── Set outputs ────────────────────────────────────────────────
         echo "passed=$PASSED" >> "$GITHUB_OUTPUT"
 
-        echo "summary<<EMAILENS_EOF" >> "$GITHUB_OUTPUT"
+        echo "summary<<$DELIM" >> "$GITHUB_OUTPUT"
         echo -e "$SUMMARY" >> "$GITHUB_OUTPUT"
-        echo "EMAILENS_EOF" >> "$GITHUB_OUTPUT"
+        echo "$DELIM" >> "$GITHUB_OUTPUT"
 
-        echo "results<<EMAILENS_RESULTS_EOF" >> "$GITHUB_OUTPUT"
+        echo "results<<${DELIM}_R" >> "$GITHUB_OUTPUT"
         echo "$ALL_RESULTS" >> "$GITHUB_OUTPUT"
-        echo "EMAILENS_RESULTS_EOF" >> "$GITHUB_OUTPUT"
+        echo "${DELIM}_R" >> "$GITHUB_OUTPUT"
 
         # ── Job summary ────────────────────────────────────────────────
         {

@@ -179,6 +179,11 @@ runs:
             jq --argjson clients "$(echo "$CLEAN_CLIENTS" | jq -R -c 'split(",")')" '. + {clients: $clients}' < "$TMPBODY" > "$TMPBODY.tmp" && mv "$TMPBODY.tmp" "$TMPBODY"
           fi
 
+          # Identify the surface. Without this every Action run lands in
+          # `previews` with a null source, which is why Marketplace installs
+          # could not be told apart from web traffic.
+          jq '. + {source: "github-action"}' < "$TMPBODY" > "$TMPBODY.tmp" && mv "$TMPBODY.tmp" "$TMPBODY"
+
           # Call API with retry
           CURL_HEADERS=(-H "Content-Type: application/json")
           if [ -n "${INPUT_API_KEY:-}" ]; then
@@ -326,6 +331,8 @@ runs:
           fi
           echo ""
           echo -e "$SUMMARY"
+          echo ""
+          echo "Full client-by-client reference at [emailens.dev/email-css](https://emailens.dev/email-css?utm_source=github-action)"
         } >> "$GITHUB_STEP_SUMMARY"
 
         # ── Exit ───────────────────────────────────────────────────────

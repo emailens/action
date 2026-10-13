@@ -63,7 +63,9 @@ runs:
         # Disable set -e — we handle errors explicitly to avoid silent crashes
         set -uo pipefail
 
-        API_URL="https://emailens.dev/api/preview"
+        # The app host, not the apex: emailens.dev answers /api/* with a 308,
+        # which curl does not follow, and following it would drop the API key.
+        API_URL="https://app.emailens.dev/api/preview"
 
         # ── Mask API key ───────────────────────────────────────────────
         if [ -n "${INPUT_API_KEY:-}" ]; then

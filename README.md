@@ -71,6 +71,44 @@ jobs:
 
 > **Quota note:** Free tier allows 30 previews/day. Each file counts as one preview. Use `max-files` and `clients` to stay within limits, or add an `api-key` for higher quotas.
 
+## Inbox mode: the email your app actually sends
+
+What breaks after you check a template is the sending pipeline: a variable
+that empties after a deploy, a link that points at staging, signing that
+stops passing. In `inbox` mode the step waits for the real email your app
+sent to your Emailens test inbox and fails when it is no longer the email
+you checked, or changed since it last arrived. Codes, tokens and tracking
+ids differ on every send and do not count.
+
+```yaml
+- name: Note the time
+  id: t
+  run: echo "since=$(date +%s000)" >> "$GITHUB_OUTPUT"
+
+- name: Make the app send its sign-up email
+  run: npm run send-signup-email   # to your Emailens test inbox address
+
+- uses: emailens/action@v1
+  with:
+    mode: inbox
+    subject: "Welcome"
+    since: ${{ steps.t.outputs.since }}
+    api-key: ${{ secrets.EMAILENS_API_KEY }}
+```
+
+| Input | Default | |
+|---|---|---|
+| `mode` | `templates` | `inbox` for this mode |
+| `subject`, `sender` | | Part of the subject or sender to wait for |
+| `inbox` | any | Inbox id |
+| `since` | `2m` | ISO time, epoch ms, or a duration back; take it before the send |
+| `timeout` | `60` | Seconds to wait, at most 600 |
+| `fail-on` | `all` | `check`, `drift` or `none` to narrow it |
+
+An email you never checked in Emailens, and its first arrival, pass and say
+so. Needs an API key and Node on the runner (GitHub-hosted runners have it);
+it runs `@emailens/cli`'s `emailens inbox wait`.
+
 ## Available Client IDs
 
 `gmail-web`, `gmail-android`, `gmail-ios`, `outlook-web`, `outlook-windows`, `outlook-windows-legacy`, `outlook-ios`, `outlook-android`, `outlook-macos`, `apple-mail-macos`, `apple-mail-ios`, `yahoo-mail`, `yahoo-mail-android`, `yahoo-mail-ios`, `samsung-mail`, `thunderbird`, `hey-mail`, `protonmail`, `aol`, `fastmail`, `superhuman`

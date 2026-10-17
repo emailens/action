@@ -1,5 +1,5 @@
 name: "Emailens Email Preview Check"
-description: "Check email templates against 21 email clients and fail the build when a compatibility score drops below your threshold."
+description: "Check email templates against 21 email clients, or the real email your app sends, and fail the build when it breaks."
 author: "Emailens"
 
 branding:
@@ -7,6 +7,30 @@ branding:
   color: "orange"
 
 inputs:
+  mode:
+    description: "'templates' (default): check email files against 21 clients. 'inbox': wait for an email your app sent to your Emailens test inbox and fail when it is no longer the email you checked, or changed since it last arrived."
+    required: false
+    default: "templates"
+  subject:
+    description: "inbox mode: part of the subject to wait for"
+    required: false
+  sender:
+    description: "inbox mode: part of the sender to wait for"
+    required: false
+  inbox:
+    description: "inbox mode: inbox id (default: any of your inboxes)"
+    required: false
+  since:
+    description: "inbox mode: only mail after this (ISO time, epoch ms, or a duration back such as 5m; default 2m). Take it before your app sends."
+    required: false
+  timeout:
+    description: "inbox mode: seconds to wait (default 60, at most 600)"
+    required: false
+    default: "60"
+  fail-on:
+    description: "inbox mode: what fails the step: all (default), check, drift, none"
+    required: false
+    default: "all"
   pattern:
     description: "Glob pattern to find email HTML files (e.g. 'emails/**/*.html')"
     required: false
@@ -39,17 +63,18 @@ outputs:
     description: "JSON array with per-file analysis results"
     value: ${{ steps.check.outputs.results }}
   passed:
-    description: "'true' if all files pass the threshold, 'false' otherwise"
-    value: ${{ steps.check.outputs.passed }}
+    description: "'true' if all files pass the threshold (inbox mode: if the email passed), 'false' otherwise"
+    value: ${{ steps.check.outputs.passed || steps.inbox.outputs.passed }}
   summary:
     description: "Human-readable summary of results"
-    value: ${{ steps.check.outputs.summary }}
+    value: ${{ steps.check.outputs.summary || steps.inbox.outputs.summary }}
 
 runs:
   using: "composite"
   steps:
     - name: Check email compatibility
       id: check
+      if: ${{ inputs.mode != 'inbox' }}
       shell: bash
       env:
         INPUT_PATTERN: ${{ inputs.pattern }}
@@ -346,3 +371,55 @@ runs:
 
         echo ""
         echo "All email templates pass compatibility threshold ($INPUT_THRESHOLD/100)"
+
+    # ── inbox mode: the real email your app sent ─────────────────────────
+    # Runs the CLI's `emailens inbox wait`, so the logic lives in one place.
+    - name: Wait for the email your app sent
+      id: inbox
+      if: ${{ inputs.mode == 'inbox' }}
+      shell: bash
+      env:
+        EMAILENS_API_KEY: ${{ inputs.api-key }}
+        INPUT_SUBJECT: ${{ inputs.subject }}
+        INPUT_SENDER: ${{ inputs.sender }}
+        INPUT_INBOX: ${{ inputs.inbox }}
+        INPUT_SINCE: ${{ inputs.since }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -uo pipefail
+        if [ -z "${EMAILENS_API_KEY:-}" ]; then
+          echo "::error::inbox mode needs api-key (an Emailens API key, from a secret)."
+          exit 1
+        fi
+        echo "::add-mask::$EMAILENS_API_KEY"
+        ARGS=(inbox wait --json --timeout "$INPUT_TIMEOUT" --fail-on "$INPUT_FAIL_ON")
+        [ -n "${INPUT_SUBJECT:-}" ] && ARGS+=(--subject "$INPUT_SUBJECT")
+        [ -n "${INPUT_SENDER:-}" ] && ARGS+=(--sender "$INPUT_SENDER")
+        [ -n "${INPUT_INBOX:-}" ] && ARGS+=(--inbox "$INPUT_INBOX")
+        [ -n "${INPUT_SINCE:-}" ] && ARGS+=(--since "$INPUT_SINCE")
+
+        OUT=$(npx --yes @emailens/cli@^0.9.0 "${ARGS[@]}")
+        CODE=$?
+        echo "$OUT"
+
+        # Node, not jq: npx already needs it, and it reads the JSON safely.
+        EMAILENS_OUT="$OUT" EMAILENS_CODE="$CODE" node -e '
+          const fs = require("fs");
+          let r = {};
+          try { r = JSON.parse(process.env.EMAILENS_OUT || "{}"); } catch {}
+          const code = process.env.EMAILENS_CODE;
+          const v = r.verdict || {};
+          const subject = (r.message && r.message.subject) || "the email";
+          const lines = [r.error, v.checked && "Your check: " + v.checked, v.sinceLast && "Since last time: " + v.sinceLast].filter(Boolean);
+          const failures = r.failures || [];
+          const delim = "EMAILENS_" + require("crypto").randomBytes(12).toString("hex");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT,
+            "passed=" + (r.pass === true) + "\n" +
+            "summary<<" + delim + "\n" + [...lines, ...failures.map((f) => "✗ " + f)].join("\n") + "\n" + delim + "\n");
+          const head = code === "0" ? subject + " passed." : code === "1" ? subject + ": changed." : subject + ": not checked.";
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+            ["## Emailens test inbox", "", "**" + head + "**", "", ...lines, ...failures.map((f) => "- " + f), ""].join("\n"));
+          for (const f of failures) console.log("::error::" + f.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A"));
+        '
+        exit "$CODE"

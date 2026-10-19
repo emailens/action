@@ -57,6 +57,14 @@ inputs:
     description: "Whether to fail the action if critical errors are found"
     required: false
     default: "true"
+  comment:
+    description: "On pull requests, keep one comment with the results up to date. Needs `permissions: pull-requests: write`; without it the step warns and carries on."
+    required: false
+    default: "true"
+  github-token:
+    description: "Token used to post the pull request comment"
+    required: false
+    default: ${{ github.token }}
 
 outputs:
   results:
@@ -310,7 +318,18 @@ runs:
 
           # Append to results array (cap at 500KB to stay under GitHub's 1MB output limit)
           if [ "$RESULTS_TRUNCATED" = false ]; then
-            RESULT_ENTRY=$(echo "$SCORES_JSON" | jq --arg file "$FILE" '{file: $file, scores: .}' 2>/dev/null) || RESULT_ENTRY=""
+            # worst and fix feed the pull request comment: the client that
+            # scored lowest, and the first error reported for it.
+            RESULT_ENTRY=$(echo "$RESPONSE_BODY" | jq -c --arg file "$FILE" '
+              (.compatibilityScores | to_entries | min_by(.value.score // 0)) as $w
+              | {
+                  file: $file,
+                  id: .id,
+                  scores: .compatibilityScores,
+                  worst: {client: $w.key, score: ($w.value.score // 0)},
+                  fix: ((.cssReport // []) | map(select(.client == $w.key and .severity == "error")) | first
+                        | if . then (.suggestion // .message) else null end)
+                }' 2>/dev/null) || RESULT_ENTRY=""
             if [ -n "$RESULT_ENTRY" ]; then
               CANDIDATE=$(echo "$ALL_RESULTS" | jq --argjson entry "$RESULT_ENTRY" '. + [$entry]' 2>/dev/null) || CANDIDATE=""
               if [ -n "$CANDIDATE" ] && [ ${#CANDIDATE} -lt 512000 ]; then
@@ -371,6 +390,57 @@ runs:
 
         echo ""
         echo "All email templates pass compatibility threshold ($INPUT_THRESHOLD/100)"
+
+    # ── Pull request comment ─────────────────────────────────────────────
+    # One comment per pull request, edited in place on every push, so the
+    # whole team sees the verdict without opening the run. Never fails the job.
+    - name: Comment on the pull request
+      if: ${{ always() && inputs.mode != 'inbox' && inputs.comment == 'true' && github.event.pull_request.number && steps.check.outputs.results != '' && steps.check.outputs.results != '[]' }}
+      shell: bash
+      env:
+        RESULTS: ${{ steps.check.outputs.results }}
+        PASSED: ${{ steps.check.outputs.passed }}
+        THRESHOLD: ${{ inputs.threshold }}
+        HAS_KEY: ${{ inputs.api-key != '' }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        GH_API: ${{ github.api_url }}
+      run: |
+        set -uo pipefail
+        MARKER="<!-- emailens-check -->"
+
+        BODY=$(echo "$RESULTS" | jq -r --arg marker "$MARKER" --arg t "$THRESHOLD" --arg passed "$PASSED" --arg key "$HAS_KEY" '
+          def cell: tostring | gsub("[\\r\\n]+"; " ") | gsub("\\|"; "\\|") | if length > 140 then .[:139] + "…" else . end;
+          (map(select((.worst.score // 100) < ($t | tonumber))) | length) as $failed
+          | [
+              $marker,
+              (if $passed == "true"
+                then "### Emailens: all \(length) template(s) pass (threshold \($t)/100)"
+                else "### Emailens: \($failed) of \(length) template(s) below \($t)/100" end),
+              "",
+              "| Template | Worst client | Score | First fix |",
+              "|---|---|---|---|",
+              (.[] | "| " + (if $key == "true" and .id then "[`\(.file)`](https://app.emailens.dev/dashboard/\(.id)?utm_source=github-action&utm_medium=pr-comment)" else "`\(.file)`" end)
+                     + " | \(.worst.client // "-") | \(.worst.score // "-") | \(.fix // "-" | cell) |"),
+              "",
+              "<sub>Checked by [Emailens](https://emailens.dev/?utm_source=github-action&utm_medium=pr-comment), the email rendering linter. Scores are per client, out of 100.</sub>"
+            ] | join("\n")')
+
+        AUTH=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+        EXISTING=$(curl -s "${AUTH[@]}" "$GH_API/repos/$REPO/issues/$PR/comments?per_page=100" \
+          | jq -r --arg m "$MARKER" 'if type == "array" then map(select(.body | startswith($m))) | first | .id // empty else empty end' 2>/dev/null || true)
+
+        PAYLOAD=$(jq -n --arg body "$BODY" '{body: $body}')
+        if [ -n "$EXISTING" ]; then
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "${AUTH[@]}" "$GH_API/repos/$REPO/issues/comments/$EXISTING" -d "$PAYLOAD") || CODE="000"
+        else
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${AUTH[@]}" "$GH_API/repos/$REPO/issues/$PR/comments" -d "$PAYLOAD") || CODE="000"
+        fi
+        case "$CODE" in
+          2*) echo "Pull request comment updated." ;;
+          *) echo "::warning::Could not comment on the pull request (HTTP $CODE). Add 'permissions: pull-requests: write' to the job, or set comment: false." ;;
+        esac
 
     # ── inbox mode: the real email your app sent ─────────────────────────
     # Runs the CLI's `emailens inbox wait`, so the logic lives in one place.

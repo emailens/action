@@ -27,6 +27,9 @@ on: [pull_request]
 jobs:
   check-emails:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # for the results comment
     steps:
       - uses: actions/checkout@v4
       - uses: emailens/action@v1
@@ -34,6 +37,12 @@ jobs:
           pattern: "emails/**/*.html"
           threshold: "70"
 ```
+
+On pull requests the action keeps one comment up to date with the worst
+client per template, its score and the first fix. It edits the same comment
+on every push instead of adding new ones. Without `pull-requests: write`
+(including pull requests from forks) it prints a warning and the check still
+runs. Set `comment: "false"` to turn it off.
 
 ## Inputs
 
@@ -46,6 +55,8 @@ jobs:
 | `clients` | Comma-separated client IDs to check | all clients |
 | `max-files` | Maximum files to check per run | `50` |
 | `fail-on-error` | Fail if critical errors found | `true` |
+| `comment` | Keep one results comment on the pull request | `true` |
+| `github-token` | Token used for the comment | `github.token` |
 
 ## Outputs
 

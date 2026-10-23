@@ -130,6 +130,7 @@ it runs `@emailens/cli`'s `emailens inbox wait`.
 - **[Engine](https://github.com/emailens/engine)** — Core analysis library (npm)
 - **[CLI](https://github.com/emailens/cli)** — Command-line tool
 - **[Web](https://emailens.dev)** — Hosted version with screenshots and sharing
+- **[Email CSS support](https://emailens.dev/email-css)** — The data behind each finding, per feature and per client
 
 ## License
 

@@ -442,7 +442,7 @@ runs:
         [ -n "${INPUT_INBOX:-}" ] && ARGS+=(--inbox "$INPUT_INBOX")
         [ -n "${INPUT_SINCE:-}" ] && ARGS+=(--since "$INPUT_SINCE")
 
-        OUT=$(npx --yes @emailens/cli@^0.9.0 "${ARGS[@]}")
+        OUT=$(npx --yes @emailens/cli@^0.11.0 "${ARGS[@]}")
         CODE=$?
         echo "$OUT"
 

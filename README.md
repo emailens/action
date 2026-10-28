@@ -29,7 +29,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write # for the results comment
     steps:
       - uses: actions/checkout@v4
       - uses: emailens/action@v1
@@ -38,11 +37,35 @@ jobs:
           threshold: "70"
 ```
 
-On pull requests the action keeps one comment up to date with the worst
-client per template, its score and the first fix. It edits the same comment
-on every push instead of adding new ones. Without `pull-requests: write`
-(including pull requests from forks) it prints a warning and the check still
-runs. Set `comment: "false"` to turn it off.
+## Pull request comment (opt-in)
+
+Set `comment: true` and grant the job `pull-requests: write`, and the action
+keeps one comment on the pull request with the score per client for each
+template, worst client first, and the first fix. Every push edits the same
+comment instead of adding one. When the check fails, the comment ends with a
+link to see the email rendered in Gmail, Outlook and Apple Mail, no signup.
+
+```yaml
+jobs:
+  check-emails:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write # only for the comment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: emailens/action@v1
+        with:
+          pattern: "emails/**/*.html"
+          comment: true
+```
+
+It comments only on `pull_request` events. On any other event, or when the
+token cannot write comments (pull requests from forks never can), it logs one
+line and skips; the check itself is unaffected. It uses the job's own
+`github.token`: no secret to add, and the token is sent only to the GitHub
+API, never printed. Without `comment: true` it makes no GitHub API call at
+all. Needs Node on the runner (GitHub-hosted runners have it).
 
 ## Inputs
 
@@ -55,8 +78,8 @@ runs. Set `comment: "false"` to turn it off.
 | `clients` | Comma-separated client IDs to check | all clients |
 | `max-files` | Maximum files to check per run | `50` |
 | `fail-on-error` | Fail if critical errors found | `true` |
-| `comment` | Keep one results comment on the pull request | `true` |
-| `github-token` | Token used for the comment | `github.token` |
+| `comment` | Opt-in: keep one comment with the score per client on the pull request | `false` |
+| `github-token` | Token used for the comment, only read when `comment` is `true` | `github.token` |
 
 ## Outputs
 
@@ -123,6 +146,11 @@ it runs `@emailens/cli`'s `emailens inbox wait`.
 ## Available Client IDs
 
 `gmail-web`, `gmail-android`, `gmail-ios`, `outlook-web`, `outlook-windows`, `outlook-windows-legacy`, `outlook-ios`, `outlook-android`, `outlook-macos`, `apple-mail-macos`, `apple-mail-ios`, `yahoo-mail`, `yahoo-mail-android`, `yahoo-mail-ios`, `samsung-mail`, `thunderbird`, `hey-mail`, `protonmail`, `aol`, `fastmail`, `superhuman`
+
+## Development
+
+`node --test` runs the comment tests (`comment.test.mjs`): opt-in, create vs
+update, and every skip.
 
 ## Related
 

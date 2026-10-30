@@ -7,9 +7,9 @@
 
 **Email rendering checks for your CI**
 
-[![license](https://img.shields.io/github/license/emailens/action)](./LICENSE)
+[![license](https://img.shields.io/github/license/emailens/action?cacheSeconds=86400)](./LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-blue)](https://github.com/emailens/mcp)
-[![GitHub stars](https://img.shields.io/github/stars/emailens/action?style=flat)](https://github.com/emailens/action/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/emailens/action?style=flat&cacheSeconds=86400)](https://github.com/emailens/action/stargazers)
 
 </div>
 
